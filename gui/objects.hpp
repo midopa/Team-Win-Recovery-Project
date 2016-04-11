@@ -1176,7 +1176,7 @@ protected:
 	void ConnectDot(int dot_idx);
 	void ConnectIntermediateDots(int dot_idx);
 	void Resize(size_t size);
-	int InDot(int x, int y);
+	int InDot(int touch_x, int touch_y);
 	bool DotUsed(int dot_idx);
 	std::string GeneratePassphrase();
 	void PatternDrawn();
@@ -1211,6 +1211,10 @@ protected:
 	std::string mPassVar;
 	GUIAction *mAction;
 	int mUpdate;
+
+private:
+	// maximum number of dots the current grid can have
+	size_t mMaxDots;
 };
 
 

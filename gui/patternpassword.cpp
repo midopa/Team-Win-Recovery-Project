@@ -19,6 +19,12 @@ extern "C" {
 #include "rapidxml.hpp"
 #include "objects.hpp"
 
+// marshmallow changed how patterns and such are expected
+static constexpr int MARSHMALLOW_SDK = 23;
+
+// scale each dot's radius by this factor when checking if a dot is touched
+static constexpr int DOT_TOUCH_PADDING_SCALE = 3;
+
 GUIPatternPassword::GUIPatternPassword(xml_node<>* node)
 	: GUIObject(node)
 {
@@ -27,8 +33,9 @@ GUIPatternPassword::GUIPatternPassword(xml_node<>* node)
 
 	// 3x3 is the default.
 	mGridSize = 3;
-	mDots = new Dot[mGridSize * mGridSize];
-	mConnectedDots = new int[mGridSize * mGridSize];
+	mMaxDots = mGridSize * mGridSize;
+	mDots = new Dot[mMaxDots];
+	mConnectedDots = new int[mMaxDots];
 
 	ResetActiveDots();
 	mTrackingTouch = false;
@@ -115,7 +122,7 @@ void GUIPatternPassword::ResetActiveDots()
 {
 	mConnectedDotsLen = 0;
 	mCurLineX = mCurLineY = -1;
-	for(size_t i = 0; i < mGridSize * mGridSize; ++i)
+	for(size_t i = 0; i < mMaxDots; ++i)
 		mDots[i].active = false;
 }
 
@@ -185,7 +192,7 @@ int GUIPatternPassword::Render(void)
 		gr_line(dc.x + mDotRadius, dc.y + mDotRadius, mCurLineX, mCurLineY, mLineWidth);
 	}
 
-	for(size_t i = 0; i < mGridSize * mGridSize; ++i) {
+	for(size_t i = 0; i < mMaxDots; ++i) {
 		if(mDotCircle) {
 			gr_blit(mDotCircle, 0, 0, gr_get_width(mDotCircle), gr_get_height(mDotCircle), mDots[i].x, mDots[i].y);
 			if(mDots[i].active) {
@@ -214,15 +221,16 @@ int GUIPatternPassword::Update(void)
 }
 
 void GUIPatternPassword::Resize(size_t n) {
-	if(mGridSize == n)
+	if(mGridSize == n || n == 0)
 		return;
 
 	delete[] mDots;
 	delete[] mConnectedDots;
 
 	mGridSize = n;
-	mDots = new Dot[n*n];
-	mConnectedDots = new int[n*n];
+	mMaxDots = n * n;
+	mDots = new Dot[mMaxDots];
+	mConnectedDots = new int[mMaxDots];
 
 	ResetActiveDots();
 	CalculateDotPositions();
@@ -230,22 +238,21 @@ void GUIPatternPassword::Resize(size_t n) {
 	mNeedRender = true;
 }
 
-static int pow(int x, int i)
-{
-	while(i-- > 1)
-		x *= x;
-	return x;
+static inline int squared(int x) {
+	return x * x;
 }
 
 static bool IsInCircle(int x, int y, int ox, int oy, int r)
 {
-	return pow(x - ox, 2) + pow(y - oy, 2) <= pow(r, 2);
+	// check if the x,y point falls within the radius distance of ox,oy point
+	// ie: check if the dist between x,y and ox,oy is <= than the radius
+	return squared(x - ox) + squared(y - oy) <= squared(r);
 }
 
-int GUIPatternPassword::InDot(int x, int y)
+int GUIPatternPassword::InDot(int touch_x, int touch_y)
 {
-	for(size_t i = 0; i < mGridSize * mGridSize; ++i) {
-		if(IsInCircle(x, y, mDots[i].x + mDotRadius, mDots[i].y + mDotRadius, mDotRadius*3))
+	for(size_t i = 0; i < mMaxDots; ++i) {
+		if(IsInCircle(touch_x, touch_y, mDots[i].x + mDotRadius, mDots[i].y + mDotRadius, mDotRadius * DOT_TOUCH_PADDING_SCALE))
 			return i;
 	}
 	return -1;
@@ -253,18 +260,22 @@ int GUIPatternPassword::InDot(int x, int y)
 
 bool GUIPatternPassword::DotUsed(int dot_idx)
 {
-	for(size_t i = 0; i < mConnectedDotsLen; ++i) {
-		if(mConnectedDots[i] == dot_idx)
-			return true;
-	}
-	return false;
+	// prevent out of bounds errors
+	if (dot_idx < 0 || dot_idx >= mMaxDots)
+		return false;
+	return mDots[dot_idx].active;
 }
 
 void GUIPatternPassword::ConnectDot(int dot_idx)
 {
-	if(mConnectedDotsLen >= mGridSize * mGridSize)
+	if(mConnectedDotsLen >= mMaxDots)
 	{
 		LOGERR("mConnectedDots in GUIPatternPassword has overflown!\n");
+		return;
+	}
+	if(dot_idx < 0)
+	{
+		LOGERR("dot_idx was negative!\n");
 		return;
 	}
 
@@ -404,54 +415,61 @@ int GUIPatternPassword::NotifyVarChange(const std::string& varName, const std::s
 }
 
 static unsigned int getSDKVersion(void) {
-	unsigned int sdkver = 23;
+	unsigned int sdkver = MARSHMALLOW_SDK;
 	string sdkverstr = TWFunc::System_Property_Get("ro.build.version.sdk");
 	if (!sdkverstr.empty()) {
 		sdkver = (unsigned int)strtoull(sdkverstr.c_str(), NULL, 10);
-		sdkver = (sdkver != 0) ? sdkver : 23;
+		sdkver = (sdkver != 0) ? sdkver : MARSHMALLOW_SDK;
 	}
 	LOGINFO("sdk version is %u\n", sdkver);
 	return sdkver;
 }
 
+/*
+ * We need to support both Android and Cyanogenmod.
+ * Android only has 3x3 grid passphrases. Cyanogenmod supports larger. This
+ * boils down to two independent variables: Grid size and SDK version.
+ *
+ * Grid sizes < 3x3 are not supported.
+ *
+ * Grid sizes == 3x3 OR SDK version >= 23:
+ * The passphrase must be a string of single-digit, 1-based dot indices. So
+ * we add 1 before stringifying.
+ *
+ * Grid sizes > 3x3 (Cyanogenmod) AND SDK version < 23:
+ * The passphrase must be a string of two-digit, 0-based, hex dot indices.
+ * IOW, a format string of "%.2x" will suffice.
+ *
+ * This code is written to support at most 16x16 grids. I think it's fair to
+ * say 16x16+ grids don't need a solution right now.
+ */
 std::string GUIPatternPassword::GeneratePassphrase()
 {
-	char pattern[mConnectedDotsLen];
-	for(size_t i = 0; i < mConnectedDotsLen; i++) {
-		 pattern[i] = (char) mConnectedDots[i];
-	}
-
 	std::stringstream pass;
 	char buffer[3] = {0};
 
-	if ((mGridSize == 3) || (getSDKVersion() >= 23)) {
-		// Marshmallow uses a consistent method
-		for (size_t i = 0; i < mConnectedDotsLen; i++) {
-			buffer[0] = (pattern[i] & 0xff) + '1';
-			pass << std::string(buffer);
+	// generate the passphrase dot by dot in the connected dot array
+	for (size_t i = 0; i < mConnectedDotsLen; i++) {
+		// truncate indices. we don't support > 64 (ie. > 16x16 grids) yet.
+		// ensures the strings are finite and consistent lengths.
+		const char dot_index = (const char) ((char) mConnectedDots[i] & 0xff);
+
+		if ((mGridSize == 3) || (getSDKVersion() >= MARSHMALLOW_SDK)) {
+			// FIXME what if sdk >= 23 and grid size > 3? this won't work.
+			// i assume we switch to using two digit hex. need to clarify
+
+			// 1-based, one-digit, decimal index
+			// shortcut to 'stringifying'. just convert to ascii codes
+			buffer[0] = dot_index + '1';
+		} else {
+			// 0-based, two-digit, hex index
+			snprintf(buffer, sizeof(buffer), "%.2x", dot_index);
 		}
-	} else {
-		/*
-		 * Okay, rant time for pre-Marshmallow ROMs.
-		 * It turns out that Android and CyanogenMod have *two* separate methods
-		 * for generating passphrases from patterns. This is a legacy issue, as
-		 * Android only supports 3x3 grids, and so we need to support both.
-		 * Luckily, CyanogenMod is in the same boat as us and needs to support
-		 * Android's 3x3 encryption style.
-		 *
-		 * In order to generate a 3x3 passphrase, add 1 to each dot index
-		 * and concatenate the string representation of the integers. No
-		 * padding should be added.
-		 *
-		 * For *all* other NxN passphrases (until a 16x16 grid comes along),
-		 * they are generated by taking "%.2x" for each dot index and
-		 * concatenating the results (without adding 1).
-		 */
-		for (size_t i = 0; i < mConnectedDotsLen; i++) {
-			snprintf(buffer, 3, "%.2x", pattern[i] & 0xff);
-			pass << std::string(buffer);
-		}
+		// append to passphrase
+		pass << std::string(buffer);
 	}
+
+	LOGERR(pass.str());
 
 	return pass.str();
 }
